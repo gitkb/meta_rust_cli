@@ -143,4 +143,16 @@ mod tests {
         assert_eq!(all, [run_in(root), run_in(&member)]);
         assert_eq!(filtered, [run_in(&member)]);
     }
+
+    #[test]
+    fn help_stops_at_the_separator() {
+        let help = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let result = execute_command(&args, &Default::default(), &[], Path::new("."));
+            matches!(result, CommandResult::ShowHelp(None))
+        };
+        assert!(help(&[]));
+        assert!(help(&["build", "--help"]));
+        assert!(!help(&["run", "--", "--help"]));
+    }
 }
