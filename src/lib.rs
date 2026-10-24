@@ -16,15 +16,14 @@ pub fn execute_command(
     projects: &[String],
     cwd: &Path,
 ) -> CommandResult {
-    // `meta cargo` and `meta cargo <cmd> --help` show this plugin's help
-    // instead of running cargo once per repo. Args after `--` belong to cargo.
-    let mut before_separator = args.iter().take_while(|a| *a != "--");
-    if args.is_empty() || before_separator.any(|a| a == "--help" || a == "-h") {
+    // `meta cargo` and any `--help`/`-h` show this plugin's help instead of
+    // running cargo once per repo. meta_cli sends help requests without the
+    // repo list, so cargo's own help could not reach each repo anyway.
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         return CommandResult::ShowHelp(None);
     }
 
-    let cmd = match shlex::try_join(std::iter::once("cargo").chain(args.iter().map(String::as_str)))
-    {
+    let cmd = match command_line(args) {
         Ok(cmd) => cmd,
         Err(e) => return CommandResult::Error(format!("Cannot quote cargo arguments: {e}")),
     };
@@ -58,6 +57,20 @@ pub fn execute_command(
         })
         .collect();
     CommandResult::Plan(commands, Some(options.parallel))
+}
+
+/// `cargo <args>` quoted for the `$SHELL -c` that loop_lib runs plans with.
+#[cfg(not(windows))]
+fn command_line(args: &[String]) -> Result<String, String> {
+    shlex::try_join(std::iter::once("cargo").chain(args.iter().map(String::as_str)))
+        .map_err(|e| e.to_string())
+}
+
+/// loop_lib runs plans with `cmd.exe /c`, which has no POSIX quoting, so the
+/// args are joined as given.
+#[cfg(windows)]
+fn command_line(args: &[String]) -> Result<String, String> {
+    Ok(format!("cargo {}", args.join(" ")))
 }
 
 /// Keep the dirs loop_lib will run in (its substring match), so the skip note
@@ -121,7 +134,8 @@ mod tests {
         let args = ["fmt", "--check", "--", "--config", "a b"];
         let commands = plan(&args, &[root, &rust, &docs], &Default::default());
 
-        let expected = format!("{}: cargo fmt --check -- --config 'a b'", rust.display());
+        let quoted = if cfg!(windows) { "a b" } else { "'a b'" };
+        let expected = format!("{}: cargo fmt --check -- --config {quoted}", rust.display());
         assert_eq!(commands, [expected]);
     }
 
@@ -145,14 +159,11 @@ mod tests {
     }
 
     #[test]
-    fn help_stops_at_the_separator() {
-        let help = |args: &[&str]| {
+    fn bare_or_help_shows_plugin_help() {
+        for args in [&[][..], &["test", "--", "--help"][..]] {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
             let result = execute_command(&args, &Default::default(), &[], Path::new("."));
-            matches!(result, CommandResult::ShowHelp(None))
-        };
-        assert!(help(&[]));
-        assert!(help(&["build", "--help"]));
-        assert!(!help(&["run", "--", "--help"]));
+            assert!(matches!(result, CommandResult::ShowHelp(None)));
+        }
     }
 }
