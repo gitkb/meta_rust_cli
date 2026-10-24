@@ -30,9 +30,9 @@ fn main() {
                     "meta cargo --version".to_string(),
                 ],
                 note: Some(
-                    "Repos without a Cargo.toml are skipped. A repo whose package is a default \
-                     member of a Cargo workspace rooted at another selected repo is skipped too: \
-                     cargo already runs on it from that root. For cargo's own help: cargo help <command>"
+                    "Repos without a Cargo.toml are skipped. A Cargo workspace that spans repos \
+                     runs in each of them; for one run from its root, use plain cargo there. \
+                     For cargo's own help: cargo help <command>"
                         .to_string(),
                 ),
             }),

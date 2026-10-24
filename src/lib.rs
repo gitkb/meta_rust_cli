@@ -3,16 +3,13 @@
 //! Runs any cargo command across the Rust repos of a meta workspace.
 
 pub use meta_plugin_protocol::{CommandResult, PlannedCommand, PluginRequestOptions};
-use serde_json::Value;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 /// Plan `cargo <args>` in every selected repo that has a `Cargo.toml`.
 ///
 /// `projects` is the repo list from meta_cli (it includes the meta root);
-/// when it is empty the plan runs in `cwd` only. Include/exclude filters are
-/// applied here, the same way loop_lib applies them, so that workspace
-/// members are only skipped when their workspace root is really selected.
+/// when it is empty the plan runs in `cwd` only. A Cargo workspace that spans
+/// repos runs in each of them; plain `cargo` in its root runs it once.
 pub fn execute_command(
     args: &[String],
     options: &PluginRequestOptions,
@@ -39,22 +36,13 @@ pub fn execute_command(
     };
     // Notes name repos by their path from the meta root, which meta_cli lists first.
     let root = cwd.join(dirs.first().map_or(".", String::as_str));
-    let dirs = filter_dirs(dirs, options);
-    let (mut rust_dirs, other_dirs): (Vec<String>, Vec<String>) = dirs
+    let (rust_dirs, other_dirs): (Vec<String>, Vec<String>) = filter_dirs(dirs, options)
         .into_iter()
         .partition(|dir| cwd.join(dir).join("Cargo.toml").is_file());
-    let workspaces = workspace_members(&rust_dirs, cwd);
-    rust_dirs.retain(|dir| !workspaces.iter().any(|(_, members)| members.contains(dir)));
 
-    if !options.silent {
-        note(&other_dirs, "no Cargo.toml", &root);
-        for (workspace, members) in &workspaces {
-            let reason = format!(
-                "cargo runs on them from the workspace at {}",
-                display(workspace, &root)
-            );
-            note(members, &reason, &root);
-        }
+    if !options.silent && !other_dirs.is_empty() {
+        let names: Vec<String> = other_dirs.iter().map(|dir| display(dir, &root)).collect();
+        eprintln!("meta-rust: skipping {} (no Cargo.toml)", names.join(", "));
     }
 
     if rust_dirs.is_empty() {
@@ -72,7 +60,8 @@ pub fn execute_command(
     CommandResult::Plan(commands, Some(options.parallel))
 }
 
-/// Keep the dirs loop_lib will run in (substring match, like loop_lib).
+/// Keep the dirs loop_lib will run in (its substring match), so the skip note
+/// names only selected repos.
 fn filter_dirs(mut dirs: Vec<String>, options: &PluginRequestOptions) -> Vec<String> {
     if let Some(includes) = options.include_filters.as_ref().filter(|f| !f.is_empty()) {
         dirs.retain(|dir| includes.iter().any(|f| dir.contains(f.as_str())));
@@ -85,72 +74,6 @@ fn filter_dirs(mut dirs: Vec<String>, options: &PluginRequestOptions) -> Vec<Str
         });
     }
     dirs
-}
-
-/// Each dir in `rust_dirs` that is a workspace root, with the other dirs in
-/// `rust_dirs` whose package it builds by default. Cargo in the root already
-/// runs on those members.
-fn workspace_members(rust_dirs: &[String], cwd: &Path) -> Vec<(String, Vec<String>)> {
-    let manifest = |dir: &str| cwd.join(dir).join("Cargo.toml").canonicalize().ok();
-    let mut workspaces = Vec::new();
-    for root in rust_dirs {
-        let root_path = cwd.join(root);
-        let nested = || {
-            rust_dirs
-                .iter()
-                .filter(|dir| *dir != root && cwd.join(dir).starts_with(&root_path))
-        };
-        if nested().next().is_none() {
-            continue;
-        }
-        let manifests = default_member_manifests(&root_path);
-        let members: Vec<String> = nested()
-            .filter(|dir| manifest(dir).is_some_and(|m| manifests.contains(&m)))
-            .cloned()
-            .collect();
-        if !members.is_empty() {
-            workspaces.push((root.clone(), members));
-        }
-    }
-    workspaces
-}
-
-/// Manifests of the packages `cargo` in `root` acts on by default, or none if
-/// `root` is not a workspace root or some members are not default members.
-fn default_member_manifests(root: &Path) -> Vec<PathBuf> {
-    let Ok(output) = Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(root)
-        .output()
-    else {
-        return Vec::new();
-    };
-    let Ok(meta) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return Vec::new();
-    };
-    let is_root = meta["workspace_root"]
-        .as_str()
-        .and_then(|r| Path::new(r).canonicalize().ok())
-        .zip(root.canonicalize().ok())
-        .is_some_and(|(a, b)| a == b);
-    if !is_root || meta["workspace_members"] != meta["workspace_default_members"] {
-        return Vec::new();
-    }
-    meta["packages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|p| p["manifest_path"].as_str())
-        .filter_map(|m| Path::new(m).canonicalize().ok())
-        .collect()
-}
-
-fn note(dirs: &[String], reason: &str, root: &Path) {
-    if dirs.is_empty() {
-        return;
-    }
-    let names: Vec<String> = dirs.iter().map(|dir| display(dir, root)).collect();
-    eprintln!("meta-rust: skipping {} ({reason})", names.join(", "));
 }
 
 fn display(dir: &str, root: &Path) -> String {
@@ -166,17 +89,20 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn write(path: PathBuf, contents: &str) {
+    fn write(dir: &Path, file: &str, contents: &str) {
+        let path = dir.join(file);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
     }
 
-    fn plan(args: &[&str], projects: &[&str], cwd: &Path) -> Vec<PlannedCommand> {
+    fn plan(args: &[&str], projects: &[&Path], options: &PluginRequestOptions) -> Vec<String> {
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-        let projects: Vec<String> = projects.iter().map(|p| p.to_string()).collect();
-        let options = PluginRequestOptions::default();
-        match execute_command(&args, &options, &projects, cwd) {
-            CommandResult::Plan(commands, _) => commands,
+        let projects: Vec<String> = projects.iter().map(|p| p.display().to_string()).collect();
+        match execute_command(&args, options, &projects, Path::new(".")) {
+            CommandResult::Plan(commands, _) => commands
+                .into_iter()
+                .map(|c| format!("{}: {}", c.dir, c.cmd))
+                .collect(),
             _ => panic!("Expected Plan result"),
         }
     }
@@ -184,61 +110,37 @@ mod tests {
     #[test]
     fn any_cargo_command_runs_in_rust_repos_only() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().display().to_string();
-        let rust = temp.path().join("rust").display().to_string();
-        let docs = temp.path().join("docs").display().to_string();
-        write(
-            temp.path().join("rust/Cargo.toml"),
-            "[package]\nname = \"rust\"\n",
-        );
-        std::fs::create_dir_all(temp.path().join("docs")).unwrap();
-
-        let commands = plan(
-            &["fmt", "--check", "--", "--config", "a b"],
-            &[&root, &rust, &docs],
+        let (root, rust, docs) = (
             temp.path(),
+            temp.path().join("rust"),
+            temp.path().join("docs"),
         );
+        write(&rust, "Cargo.toml", "[package]\nname = \"rust\"\n");
+        write(&docs, "README.md", "");
 
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].dir, rust);
-        assert_eq!(commands[0].cmd, "cargo fmt --check -- --config 'a b'");
+        let args = ["fmt", "--check", "--", "--config", "a b"];
+        let commands = plan(&args, &[root, &rust, &docs], &Default::default());
+
+        let expected = format!("{}: cargo fmt --check -- --config 'a b'", rust.display());
+        assert_eq!(commands, [expected]);
     }
 
     #[test]
-    fn workspace_members_run_once_from_the_root() {
+    fn workspace_members_run_in_their_own_repos_within_filters() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().display().to_string();
-        let member = temp.path().join("member").display().to_string();
-        let own = temp.path().join("own").display().to_string();
-        write(
-            temp.path().join("Cargo.toml"),
-            "[workspace]\nmembers = [\"member\"]\nexclude = [\"own\"]\n",
-        );
-        for name in ["member", "own"] {
-            write(
-                temp.path().join(name).join("Cargo.toml"),
-                &format!("[package]\nname = \"{name}\"\n"),
-            );
-            write(temp.path().join(name).join("src/lib.rs"), "");
-        }
+        let (root, member) = (temp.path(), temp.path().join("member"));
+        write(root, "Cargo.toml", "[workspace]\nmembers = [\"member\"]\n");
+        write(&member, "Cargo.toml", "[package]\nname = \"member\"\n");
 
-        let commands = plan(&["--version"], &[&root, &member, &own], temp.path());
-        let dirs: Vec<&str> = commands.iter().map(|c| c.dir.as_str()).collect();
-        assert_eq!(dirs, [root.as_str(), own.as_str()]);
-
-        // With the root filtered out, the member runs on its own.
-        let options = PluginRequestOptions {
+        let all = plan(&["run"], &[root, &member], &Default::default());
+        let only_member = PluginRequestOptions {
             include_filters: Some(vec!["member".to_string()]),
             ..Default::default()
         };
-        let args = vec!["--version".to_string()];
-        let projects = vec![root, member.clone(), own];
-        match execute_command(&args, &options, &projects, temp.path()) {
-            CommandResult::Plan(commands, _) => {
-                assert_eq!(commands.len(), 1);
-                assert_eq!(commands[0].dir, member);
-            }
-            _ => panic!("Expected Plan result"),
-        }
+        let filtered = plan(&["run"], &[root, &member], &only_member);
+
+        let run_in = |dir: &Path| format!("{}: cargo run", dir.display());
+        assert_eq!(all, [run_in(root), run_in(&member)]);
+        assert_eq!(filtered, [run_in(&member)]);
     }
 }
