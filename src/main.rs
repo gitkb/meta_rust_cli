@@ -9,37 +9,32 @@ use std::path::PathBuf;
 fn main() {
     let mut help_commands = IndexMap::new();
     help_commands.insert(
-        "build".to_string(),
-        "Build all Rust projects in the workspace".to_string(),
-    );
-    help_commands.insert(
-        "test".to_string(),
-        "Run tests across all Rust projects".to_string(),
+        "cargo".to_string(),
+        "Run cargo with your args in each selected repo that has a Cargo.toml".to_string(),
     );
 
     run_plugin(PluginDefinition {
         info: PluginInfo {
             name: "rust".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            commands: vec![
-                "cargo build".to_string(),
-                "cargo test".to_string(),
-                "rust build".to_string(),
-                "rust test".to_string(),
-            ],
-            description: Some("Rust/Cargo commands for meta repositories".to_string()),
+            commands: vec!["cargo".to_string()],
+            description: Some("Run cargo across the Rust repos of a meta workspace".to_string()),
             help: Some(PluginHelp {
-                usage: "meta cargo <command> [args...]\n       meta rust <command> [args...]"
-                    .to_string(),
+                usage: "meta cargo <cargo args>".to_string(),
                 commands: help_commands,
                 command_sections: IndexMap::new(),
                 examples: vec![
-                    "meta cargo build".to_string(),
-                    "meta cargo test".to_string(),
-                    "meta rust build".to_string(),
                     "meta cargo build --release".to_string(),
+                    "meta cargo fmt --check".to_string(),
+                    "meta --include api cargo clippy --all-targets -- -D warnings".to_string(),
+                    "meta cargo --version".to_string(),
                 ],
-                note: Some("To run raw cargo commands: meta exec -- cargo <command>".to_string()),
+                note: Some(
+                    "Repos without a Cargo.toml are skipped. A repo whose package is a default \
+                     member of a Cargo workspace rooted at another selected repo is skipped too: \
+                     cargo already runs on it from that root. For cargo's own help: cargo help <command>"
+                        .to_string(),
+                ),
             }),
         },
         execute,
@@ -56,11 +51,5 @@ fn execute(request: PluginRequest) -> CommandResult {
         PathBuf::from(&request.cwd)
     };
 
-    meta_rust_cli::execute_command(
-        &request.command,
-        &request.args,
-        request.options.parallel,
-        &request.projects,
-        &cwd,
-    )
+    meta_rust_cli::execute_command(&request.args, &request.options, &request.projects, &cwd)
 }
