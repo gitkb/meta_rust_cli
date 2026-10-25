@@ -19,28 +19,26 @@ pub fn execute_command(
     // `meta cargo` and any `--help`/`-h` show this plugin's help instead of
     // running cargo once per repo. meta_cli sends help requests without the
     // repo list, so cargo's own help could not reach each repo anyway.
-    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+    let help = args
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--help" || a == "-h");
+    if args.is_empty() || help {
         return CommandResult::ShowHelp(None);
     }
-
-    let cmd = match command_line(args) {
-        Ok(cmd) => cmd,
-        Err(e) => return CommandResult::Error(format!("Cannot quote cargo arguments: {e}")),
-    };
 
     let dirs: Vec<String> = if projects.is_empty() {
         vec![".".to_string()]
     } else {
         projects.to_vec()
     };
-    // Notes name repos by their path from the meta root, which meta_cli lists first.
-    let root = cwd.join(dirs.first().map_or(".", String::as_str));
-    let (rust_dirs, other_dirs): (Vec<String>, Vec<String>) = filter_dirs(dirs, options)
+    let (rust_dirs, other_dirs): (Vec<String>, Vec<String>) = dirs
         .into_iter()
         .partition(|dir| cwd.join(dir).join("Cargo.toml").is_file());
 
     if !options.silent && !other_dirs.is_empty() {
-        let names: Vec<String> = other_dirs.iter().map(|dir| display(dir, &root)).collect();
+        // meta_cli sends only the selected repos, so name them from the cwd
+        let names: Vec<String> = other_dirs.iter().map(|dir| display(dir, cwd)).collect();
         eprintln!("meta-rust: skipping {} (no Cargo.toml)", names.join(", "));
     }
 
@@ -52,41 +50,13 @@ pub fn execute_command(
         .into_iter()
         .map(|dir| PlannedCommand {
             dir,
-            cmd: cmd.clone(),
+            argv: std::iter::once("cargo".to_string())
+                .chain(args.iter().cloned())
+                .collect(),
             env: None,
         })
         .collect();
     CommandResult::Plan(commands, Some(options.parallel))
-}
-
-/// `cargo <args>` quoted for the `$SHELL -c` that loop_lib runs plans with.
-#[cfg(not(windows))]
-fn command_line(args: &[String]) -> Result<String, String> {
-    shlex::try_join(std::iter::once("cargo").chain(args.iter().map(String::as_str)))
-        .map_err(|e| e.to_string())
-}
-
-/// loop_lib runs plans with `cmd.exe /c`, which has no POSIX quoting, so the
-/// args are joined as given.
-#[cfg(windows)]
-fn command_line(args: &[String]) -> Result<String, String> {
-    Ok(format!("cargo {}", args.join(" ")))
-}
-
-/// Keep the dirs loop_lib will run in (its substring match), so the skip note
-/// names only selected repos.
-fn filter_dirs(mut dirs: Vec<String>, options: &PluginRequestOptions) -> Vec<String> {
-    if let Some(includes) = options.include_filters.as_ref().filter(|f| !f.is_empty()) {
-        dirs.retain(|dir| includes.iter().any(|f| dir.contains(f.as_str())));
-    }
-    if let Some(excludes) = &options.exclude_filters {
-        dirs.retain(|dir| {
-            !excludes
-                .iter()
-                .any(|f| dir.contains(f.trim_end_matches('/')))
-        });
-    }
-    dirs
 }
 
 fn display(dir: &str, root: &Path) -> String {
@@ -114,7 +84,7 @@ mod tests {
         match execute_command(&args, options, &projects, Path::new(".")) {
             CommandResult::Plan(commands, _) => commands
                 .into_iter()
-                .map(|c| format!("{}: {}", c.dir, c.cmd))
+                .map(|c| format!("{}: {:?}", c.dir, c.argv))
                 .collect(),
             _ => panic!("Expected Plan result"),
         }
@@ -134,33 +104,50 @@ mod tests {
         let args = ["fmt", "--check", "--", "--config", "a b"];
         let commands = plan(&args, &[root, &rust, &docs], &Default::default());
 
-        let quoted = if cfg!(windows) { "a b" } else { "'a b'" };
-        let expected = format!("{}: cargo fmt --check -- --config {quoted}", rust.display());
+        let expected = format!(
+            "{}: {:?}",
+            rust.display(),
+            ["cargo", "fmt", "--check", "--", "--config", "a b"]
+        );
         assert_eq!(commands, [expected]);
     }
 
     #[test]
-    fn workspace_members_run_in_their_own_repos_within_filters() {
+    fn workspace_members_run_in_their_own_repos() {
         let temp = TempDir::new().unwrap();
         let (root, member) = (temp.path(), temp.path().join("member"));
         write(root, "Cargo.toml", "[workspace]\nmembers = [\"member\"]\n");
         write(&member, "Cargo.toml", "[package]\nname = \"member\"\n");
 
+        // meta_cli sends only the repos --include/--exclude select
         let all = plan(&["run"], &[root, &member], &Default::default());
-        let only_member = PluginRequestOptions {
-            include_filters: Some(vec!["member".to_string()]),
-            ..Default::default()
-        };
-        let filtered = plan(&["run"], &[root, &member], &only_member);
+        let only_member = plan(&["run"], &[&member], &Default::default());
 
-        let run_in = |dir: &Path| format!("{}: cargo run", dir.display());
+        let run_in = |dir: &Path| format!("{}: {:?}", dir.display(), ["cargo", "run"]);
         assert_eq!(all, [run_in(root), run_in(&member)]);
-        assert_eq!(filtered, [run_in(&member)]);
+        assert_eq!(only_member, [run_in(&member)]);
+    }
+
+    #[test]
+    fn help_after_double_dash_goes_to_cargo() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        let commands = plan(
+            &["test", "--", "--help"],
+            &[temp.path()],
+            &Default::default(),
+        );
+        let expected = format!(
+            "{}: {:?}",
+            temp.path().display(),
+            ["cargo", "test", "--", "--help"]
+        );
+        assert_eq!(commands, [expected]);
     }
 
     #[test]
     fn bare_or_help_shows_plugin_help() {
-        for args in [&[][..], &["test", "--", "--help"][..]] {
+        for args in [&[][..], &["test", "--help"][..]] {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
             let result = execute_command(&args, &Default::default(), &[], Path::new("."));
             assert!(matches!(result, CommandResult::ShowHelp(None)));
