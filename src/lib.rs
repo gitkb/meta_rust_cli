@@ -32,14 +32,13 @@ pub fn execute_command(
     } else {
         projects.to_vec()
     };
-    // Notes name repos by their path from the meta root, which meta_cli lists first.
-    let root = cwd.join(dirs.first().map_or(".", String::as_str));
     let (rust_dirs, other_dirs): (Vec<String>, Vec<String>) = dirs
         .into_iter()
         .partition(|dir| cwd.join(dir).join("Cargo.toml").is_file());
 
     if !options.silent && !other_dirs.is_empty() {
-        let names: Vec<String> = other_dirs.iter().map(|dir| display(dir, &root)).collect();
+        // meta_cli sends only the selected repos, so name them from the cwd
+        let names: Vec<String> = other_dirs.iter().map(|dir| display(dir, cwd)).collect();
         eprintln!("meta-rust: skipping {} (no Cargo.toml)", names.join(", "));
     }
 
@@ -127,6 +126,23 @@ mod tests {
         let run_in = |dir: &Path| format!("{}: {:?}", dir.display(), ["cargo", "run"]);
         assert_eq!(all, [run_in(root), run_in(&member)]);
         assert_eq!(only_member, [run_in(&member)]);
+    }
+
+    #[test]
+    fn help_after_double_dash_goes_to_cargo() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        let commands = plan(
+            &["test", "--", "--help"],
+            &[temp.path()],
+            &Default::default(),
+        );
+        let expected = format!(
+            "{}: {:?}",
+            temp.path().display(),
+            ["cargo", "test", "--", "--help"]
+        );
+        assert_eq!(commands, [expected]);
     }
 
     #[test]
