@@ -23,11 +23,6 @@ pub fn execute_command(
         return CommandResult::ShowHelp(None);
     }
 
-    let cmd = match command_line(args) {
-        Ok(cmd) => cmd,
-        Err(e) => return CommandResult::Error(format!("Cannot quote cargo arguments: {e}")),
-    };
-
     let dirs: Vec<String> = if projects.is_empty() {
         vec![".".to_string()]
     } else {
@@ -35,7 +30,7 @@ pub fn execute_command(
     };
     // Notes name repos by their path from the meta root, which meta_cli lists first.
     let root = cwd.join(dirs.first().map_or(".", String::as_str));
-    let (rust_dirs, other_dirs): (Vec<String>, Vec<String>) = filter_dirs(dirs, options)
+    let (rust_dirs, other_dirs): (Vec<String>, Vec<String>) = filter_dirs(dirs, &root, options)
         .into_iter()
         .partition(|dir| cwd.join(dir).join("Cargo.toml").is_file());
 
@@ -52,39 +47,24 @@ pub fn execute_command(
         .into_iter()
         .map(|dir| PlannedCommand {
             dir,
-            cmd: cmd.clone(),
+            argv: std::iter::once("cargo".to_string())
+                .chain(args.iter().cloned())
+                .collect(),
             env: None,
         })
         .collect();
     CommandResult::Plan(commands, Some(options.parallel))
 }
 
-/// `cargo <args>` quoted for the `$SHELL -c` that loop_lib runs plans with.
-#[cfg(not(windows))]
-fn command_line(args: &[String]) -> Result<String, String> {
-    shlex::try_join(std::iter::once("cargo").chain(args.iter().map(String::as_str)))
-        .map_err(|e| e.to_string())
-}
-
-/// loop_lib runs plans with `cmd.exe /c`, which has no POSIX quoting, so the
-/// args are joined as given.
-#[cfg(windows)]
-fn command_line(args: &[String]) -> Result<String, String> {
-    Ok(format!("cargo {}", args.join(" ")))
-}
-
-/// Keep the dirs loop_lib will run in (its substring match), so the skip note
-/// names only selected repos.
-fn filter_dirs(mut dirs: Vec<String>, options: &PluginRequestOptions) -> Vec<String> {
+/// Keep the dirs loop_lib will run in, so the skip note names only selected
+/// repos. meta_cli sends the filters as whole paths from the root.
+fn filter_dirs(mut dirs: Vec<String>, root: &Path, options: &PluginRequestOptions) -> Vec<String> {
+    let named = |filters: &[String], dir: &str| filters.iter().any(|f| *f == display(dir, root));
     if let Some(includes) = options.include_filters.as_ref().filter(|f| !f.is_empty()) {
-        dirs.retain(|dir| includes.iter().any(|f| dir.contains(f.as_str())));
+        dirs.retain(|dir| named(includes, dir));
     }
     if let Some(excludes) = &options.exclude_filters {
-        dirs.retain(|dir| {
-            !excludes
-                .iter()
-                .any(|f| dir.contains(f.trim_end_matches('/')))
-        });
+        dirs.retain(|dir| !named(excludes, dir));
     }
     dirs
 }
@@ -92,7 +72,11 @@ fn filter_dirs(mut dirs: Vec<String>, options: &PluginRequestOptions) -> Vec<Str
 fn display(dir: &str, root: &Path) -> String {
     match root.join(dir).strip_prefix(root) {
         Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
-        Ok(rel) => rel.display().to_string(),
+        Ok(rel) => rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
         Err(_) => dir.to_string(),
     }
 }
@@ -114,7 +98,7 @@ mod tests {
         match execute_command(&args, options, &projects, Path::new(".")) {
             CommandResult::Plan(commands, _) => commands
                 .into_iter()
-                .map(|c| format!("{}: {}", c.dir, c.cmd))
+                .map(|c| format!("{}: {:?}", c.dir, c.argv))
                 .collect(),
             _ => panic!("Expected Plan result"),
         }
@@ -134,8 +118,11 @@ mod tests {
         let args = ["fmt", "--check", "--", "--config", "a b"];
         let commands = plan(&args, &[root, &rust, &docs], &Default::default());
 
-        let quoted = if cfg!(windows) { "a b" } else { "'a b'" };
-        let expected = format!("{}: cargo fmt --check -- --config {quoted}", rust.display());
+        let expected = format!(
+            "{}: {:?}",
+            rust.display(),
+            ["cargo", "fmt", "--check", "--", "--config", "a b"]
+        );
         assert_eq!(commands, [expected]);
     }
 
@@ -153,7 +140,7 @@ mod tests {
         };
         let filtered = plan(&["run"], &[root, &member], &only_member);
 
-        let run_in = |dir: &Path| format!("{}: cargo run", dir.display());
+        let run_in = |dir: &Path| format!("{}: {:?}", dir.display(), ["cargo", "run"]);
         assert_eq!(all, [run_in(root), run_in(&member)]);
         assert_eq!(filtered, [run_in(&member)]);
     }
