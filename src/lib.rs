@@ -30,7 +30,7 @@ pub fn execute_command(
     };
     // Notes name repos by their path from the meta root, which meta_cli lists first.
     let root = cwd.join(dirs.first().map_or(".", String::as_str));
-    let (rust_dirs, other_dirs): (Vec<String>, Vec<String>) = filter_dirs(dirs, &root, options)
+    let (rust_dirs, other_dirs): (Vec<String>, Vec<String>) = dirs
         .into_iter()
         .partition(|dir| cwd.join(dir).join("Cargo.toml").is_file());
 
@@ -56,27 +56,10 @@ pub fn execute_command(
     CommandResult::Plan(commands, Some(options.parallel))
 }
 
-/// Keep the dirs loop_lib will run in, so the skip note names only selected
-/// repos. meta_cli sends the filters as whole paths from the root.
-fn filter_dirs(mut dirs: Vec<String>, root: &Path, options: &PluginRequestOptions) -> Vec<String> {
-    let named = |filters: &[String], dir: &str| filters.iter().any(|f| *f == display(dir, root));
-    if let Some(includes) = options.include_filters.as_ref().filter(|f| !f.is_empty()) {
-        dirs.retain(|dir| named(includes, dir));
-    }
-    if let Some(excludes) = &options.exclude_filters {
-        dirs.retain(|dir| !named(excludes, dir));
-    }
-    dirs
-}
-
 fn display(dir: &str, root: &Path) -> String {
     match root.join(dir).strip_prefix(root) {
         Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
-        Ok(rel) => rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/"),
+        Ok(rel) => rel.display().to_string(),
         Err(_) => dir.to_string(),
     }
 }
@@ -127,22 +110,19 @@ mod tests {
     }
 
     #[test]
-    fn workspace_members_run_in_their_own_repos_within_filters() {
+    fn workspace_members_run_in_their_own_repos() {
         let temp = TempDir::new().unwrap();
         let (root, member) = (temp.path(), temp.path().join("member"));
         write(root, "Cargo.toml", "[workspace]\nmembers = [\"member\"]\n");
         write(&member, "Cargo.toml", "[package]\nname = \"member\"\n");
 
+        // meta_cli sends only the repos --include/--exclude select
         let all = plan(&["run"], &[root, &member], &Default::default());
-        let only_member = PluginRequestOptions {
-            include_filters: Some(vec!["member".to_string()]),
-            ..Default::default()
-        };
-        let filtered = plan(&["run"], &[root, &member], &only_member);
+        let only_member = plan(&["run"], &[&member], &Default::default());
 
         let run_in = |dir: &Path| format!("{}: {:?}", dir.display(), ["cargo", "run"]);
         assert_eq!(all, [run_in(root), run_in(&member)]);
-        assert_eq!(filtered, [run_in(&member)]);
+        assert_eq!(only_member, [run_in(&member)]);
     }
 
     #[test]
